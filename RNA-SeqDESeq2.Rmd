@@ -1,0 +1,175 @@
+---
+title: "RNA-Seq Analysis with DESeq2"
+author: "Latifah Mojisola Salaudeen"
+date: "2024-05-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# RNA-Seq analysis with DESeq2
+
+## Load files
+
+Files needed:
+
+-   The series matrix, which contains the gene expression data.
+-   The metadata which provides information about each sample and the disease status.
+-   The annotation data which shows the corresponding gene name of each probe (Some gene expression
+    data have a column with gene ids or other gene identifier, so this file may not be necessary).
+
+For expression data from a repository like GEO, the metadata and expression data are usually in one
+txt file. The metadata usually begins with "!", so this can be easily extracted (see python script).
+[metadataScript.py](metadataScript.py)
+
+As input, DESeq2 expects count data in the form of a matrix of integer
+values, so colClasses = "integer"
+
+```{r load-files}
+GSE152418SeqData = as.matrix(read.delim("Data/GSE152418/GSE152418_raw_counts_GRCh38.p13_NCBI.tsv",header=T, sep="\t", colClasses = "integer", row.names = 1))
+
+
+annotationFile = read.delim("Data/GSE152418/Human.GRCh38.p13.annot.tsv", header = T, row.names = 1)
+annotation = annotationFile[row.names(GSE152418SeqData),]    # get/arrange according to expression row names
+```
+
+The imported metadata file has several rows, hence, I'll transpose and label the columns, but I'm only interested in the getting the disease status
+
+```{r metadata file}
+
+#wrangling the metadata file
+metadata = read.delim("Data/GSE152418/GSE152418_metadata.txt")
+metadata = data.frame(t(metadata))
+
+#remove first row
+metadata = metadata[-1,]
+
+#columns of interest
+metadata = metadata[,3]
+
+names = c("diseaseStatus")
+colnames(metadata) = names
+
+```
+
+### Group Samples
+
+My dataset has 2 sample groups (17 COVID-19 subjects and 17 healthy controls)
+
+```{r}
+#create patient groups - covid(case) and control
+
+groups = rep(NA, length(metadata$diseaseStatus))      # NA - intialize a varible with NAs, the length of which is the length of the column diseaseStatus in metadata dataframe
+
+groups[grep('disease state: Healthy', metadata$diseaseStatus)] = 'case' 
+
+groups[grep('disease state: Healthy', metadata$diseaseStatus, invert = TRUE)] = 'control'
+
+metadata$status = groups  #forms a new column in metadata and fills it with items in groups
+
+all(colnames(GSE152418SeqData)==rownames(metadata)) #Check order
+
+caseIndex = which(metadata$status == "case")
+controlIndex = which(metadata$status == "control")
+
+subCovid = GSE152418SeqData[,caseIndex]
+subControl = GSE152418SeqData[,controlIndex]
+
+controlCase = c(rep('Control',ncol(subControl)),rep('Case',ncol(subCovid)))
+controlCase = factor(controlCase)
+groups = make.names(c("Control","Case"))
+levels(controlCase) = groups
+
+colData = data.frame(Group = controlCase, row.names = colnames(GSE152418SeqData))
+
+```
+
+### Pre-filter low count genes
+
+Keeping only rows(genes) that have atleast 10 for atleast 17 samples
+(smallest group size)
+
+```{r prefilter}
+#Prefiltering low count genes
+smallestGroupSize = min(table(controlCase))
+
+keep = rowSums(GSE152418SeqData >= 10) >= smallestGroupSize #returns logical true/false
+prefilteredData = GSE152418SeqData[keep,]
+
+```
+
+## Differential Expression Analysis
+
+```{r warnings = F}
+library("DESeq2")
+
+deseqDataSet = DESeqDataSetFromMatrix(countData = prefilteredData, colData = colData, design= ~Group)
+
+deseqDataSet = DESeq(deseqDataSet)
+
+resultsNames(deseqDataSet) # lists the coefficients
+
+# contrasts says what to compare to what, here it's case and control -
+deResults = results(deseqDataSet, contrast=c("Group", "Case", "Control"), alpha=0.05, pAdjustMethod ="fdr", lfcThreshold =1) # a name or contrast argument?
+summary(deResults) 
+
+```
+
+## Exporting and exploring results
+
+```{r}
+# extract results for top genes table
+
+topTable = merge(as.data.frame(deResults), annotation, by=0, sort=F)
+
+#columns of interest
+colsInterest = c("Row.names","Symbol","padj","pvalue","lfcSE","stat","log2FoldChange","baseMean","Description")
+topTable = topTable[,colsInterest]
+
+
+#dysregulated
+#cutoff is logFC>1|<-1 & pval <0.05
+dysregulated = topTable[abs(topTable$log2FoldChange) > 0.5 & topTable$padj <0.05,]
+cat("There are", nrow(dysregulated), "DEGs discovered with adjusted p value")
+
+dysregulatedwithPvalue = topTable[abs(topTable$log2FoldChange) > 0.5 & topTable$pvalue <0.05,]
+cat("There are", nrow(dysregulated), "DEGs discovered with p value")
+
+
+upregulated = dysregulated[dysregulated$log2FoldChange > 0.5,]
+upregulated
+
+
+downregulated = dysregulated[dysregulated$log2FoldChange < -0.5,]
+downregulated
+#upregulated
+
+#downregulated
+
+```
+
+## Plot
+
+```{r}
+library(ggplot2)
+
+# volcano plot
+topTable$dysregulated = "not significant"
+topTable$dysregulated[topTable$log2FoldChange> 0.5 & topTable$padj < 0.05] = 'upregulated'
+topTable$dysregulated[topTable$log2FoldChange < -0.5 & topTable$padj < 0.05] = 'downregulated'
+
+GSE152418VolcanoPlot = ggplot(topTable, aes(x = log2FoldChange, y= -log10(pvalue), col = dysregulated)) + 
+  geom_point() +
+  scale_color_manual(values = c('blue', 'black', 'red')) +
+  ggtitle("Dysregulated genes in covid vs healthy control (GSE152418)")
+
+GSE152418VolcanoPlot
+
+#save plot
+png(file = 'GSE152418VolcanoPlot.png')
+GSE152418VolcanoPlot
+dev.off()
+
+```

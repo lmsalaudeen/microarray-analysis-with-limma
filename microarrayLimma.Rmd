@@ -1,0 +1,245 @@
+---
+title: "Microarray Analysis with Limma"
+author: "Latifah Mojisola Salaudeen"
+date: "2024-03-23"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  markdown: 
+    wrap: 100
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Microarray Analysis with Limma
+
+## Setup
+
+For this, I'll be using 3 libraries:
+
+-   Biobase: to define an expression set
+
+-   limma: the main library for the analysis
+
+-   ggplot2: for data visualisation
+
+```{r libraries, include=FALSE}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("Biobase", "limma"))
+
+```
+
+## Load Files
+
+Files needed:
+
+-   The series matrix, which contains the gene expression data.
+-   The metadata which provides information about each sample and the disease status.
+-   The annotation data which shows the corresponding gene name of each probe (Some gene expression
+    data have a column with gene ids or other gene identifier, so this file may not be necessary).
+
+For expression data from a repository like GEO, the metadata and expression data are usually in one
+txt file. The metadata usually begins with "!", so this can be easily extracted (see python script).
+[metadataScript.py](metadataScript.py)
+
+```{r}
+GSE20966SeqData <- read.delim("Data/GSE20966/GSE20966_series_matrix.txt", header=T, comment.char="!", row.names=1)
+
+geneAnnotationFile   <- read.delim("Data/GSE20966/GPL1352-9802.txt", header=T, row.names = 1,sep="\t",comment.char = "#")
+geneAnnotation <- geneAnnotationFile[row.names(GSE20966SeqData),]    # arrange according to expression row names
+
+metadata <- read.delim("Data/GSE20966/GSE20966_metadata.txt", sep = "\t", header=F, row.names = 1)
+```
+
+The imported metadata file has two rows, hence, I'll transpose and label the columns
+
+```{r}
+metadata = data.frame(t(metadata)) #made it a dataframe so it's easy to access the columns with $
+
+colnames(metadata) = c("diseaseStatus", "ID")
+rownames(metadata) = metadata[,2]
+```
+
+## Group Samples
+
+My dataset has 2 sample groups (non-diabetic and diabetic patients)
+
+```{r Patient status}
+groups = rep(NA, length(metadata$diseaseStatus))      # NA - intialize a variable with NAs, the length of which is the length of the column diseaseStatus in metadata
+
+groups[grep('beta-cells_diabetic', metadata$diseaseStatus)] = 'T2diabetes'  #grep gets the index of where beta-cells_non-diabetic is found, and then replace those same index in groups variable with "T2diabetes"
+
+groups[grep('beta-cells_non-diabetic', metadata$diseaseStatus)] = 'control'
+
+metadata$status = groups  #forms a new column in metadata and fills it with items in groups
+
+```
+
+Alternaively, the diseaseStatus column can be updated instead of creating a new column
+`metadata$diseaseStatus = groups`
+
+## Normalization
+
+Here, I check the distribution of the data using a boxplot.
+
+One way to transform data is through log2 transformation (REF)
+
+```{r boxplot, warning=FALSE}
+#is there a need for log transformation/normalization?
+
+nonlog_expression <- GSE20966SeqData
+
+palette(c("yellow",  "orange"))
+par(mar=c(6,3,3,2)) #boxplot margins: bottom, left, to, right
+
+boxplot(nonlog_expression, main = "Gene expression of Control and diabetes Samples", notch=T, outline=F, las = 2, col = factor(metadata$status))
+
+
+#log_expression = log2(nonlog_expression)
+palette(c("pink",  "peachpuff"))
+log_expression <- log2(GSE20966SeqData)
+boxplot(log_expression, main = "Log 2 Gene expression of Control and diabetes Samples", notch=T, outline=F, las=2, col = factor(metadata$status))
+
+```
+
+## Differential Expression Analysis
+
+### Expression set
+
+The Biobase library has an ExpressionSet class, which can be used to combine the entities of our
+microarray data into a data object.
+
+To create an expression set, we need to define the metadata and feature data as an annotated data
+frame. Then create an ExpressionSet using the `ExpressionSet(assayData, phenoData, featureData)`
+function, and give our expression values as a matrix.
+
+```{r Expression set, message=FALSE}
+library(Biobase)
+
+#Expression set
+pData <- new("AnnotatedDataFrame",data = metadata)
+fData <- new("AnnotatedDataFrame", data = geneAnnotation)
+
+gse20966Set <- ExpressionSet(assayData = as.matrix(log_expression), phenoData = pData, featureData = fData)
+
+#Removing missing values
+gse20966Set <- gse20966Set[complete.cases(exprs(gse20966Set)), ] # skip missing values
+```
+
+### Linear model
+
+We'll create a design matrix which includes separate coefficients for diabetes samples and normal
+samples. This can be done using the `model.matrix()` function
+
+```{r limma design matrix, message=FALSE}
+library(limma)
+
+design <- model.matrix(~ 0 + status, metadata)
+```
+
+status is a column in the metadata dataframe.
+
+Another way to do this is by creating another variable:
+
+`Group <- factor(metadata$status, levels=c("control","T2diabetes"))`
+
+Then: `design <- model.matrix(~0 + Group)`
+
+Reassigning the column names of design
+
+```{r design colnames, message=FALSE}
+colnames(design) = levels(factor(metadata$status))
+```
+
+When reassigning column names, careful not to mis-label and mix-up the control and the test
+(diabetes).
+
+The following 4 lines of codes computes the differentially expressed genes.
+
+-   First, we call the `lmfit()` function and give it the expression set and the design matrix as
+    arguments.
+-   With the `makeContrasts()` function, we define the groups we're comparing. Here it's
+    "T2diabetes" against the "control"
+-   `contrasts.fit()` matrix can be used to expand the linear model fit to make comparison between
+    the two groups
+-   `eBayes()` computes the empirical Bayes statistics.
+
+```{r limma model}
+#fitting the model
+fit <- lmFit(gse20966Set, design)
+cont.matrix <- makeContrasts(contrasts = "T2diabetes-control", levels=design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+```
+
+A list of top genes differential expressed in T2diabetes versus control can be obtained from
+`topTable()`
+
+```{r top genes}
+topGenes <- topTable(fit2)
+
+topGenes[1:5, 16:21]
+```
+
+`topTable()` returns the top 10 results. One can parse in maximum number of genes to list with the
+`number` argument.
+
+With the `adjust.method` argument, one can specify what method to be used to adjust the p-values for
+multiple testing. The default is the Benjamini & Hochberg method -- "BH" (a.k.a "fdr").
+
+```{r top table Inf number}
+limmaResult <- topTable(fit2, adjust.method ="fdr", number = Inf)
+```
+
+we can obtain the outcome of each hypothesis with `decideTest()`, then use a Venn diagram to show
+the number of significant genes.
+
+```{r Venn diagram}
+vennDiagram(decideTests(fit2, lfc = 0.5, p.value = 0.05))
+```
+
+lfc and p.value arguments specify the desired log fold change and adjusted p value.
+
+```{r}
+
+#cutoff is logFC>o.5|<-0.5 & pval <0.05
+dysregulated <- limmaResult[abs(limmaResult$logFC)> 0.5 & limmaResult$adj.P.Val < 0.05,]
+cat("There are", nrow(dysregulated), "DEGs discovered (before filtering out empty entrez ids)\n")
+
+# removing results with empty Entrez ids
+limmaResult <- limmaResult[limmaResult$ENTREZ_GENE_ID !="", ] 
+
+#cutoff is logFC>o.5|<-0.5 & pval <0.05
+dysregulated <- limmaResult[abs(limmaResult$logFC)> 0.5 & limmaResult$adj.P.Val < 0.05,]
+cat("There are", nrow(dysregulated), "DEGs discovered\n")
+
+upregulated <- dysregulated[dysregulated$logFC > 0.5,]
+cat("There are", nrow(upregulated), "DEGs discovered\n")
+
+downregulated <- dysregulated[dysregulated$logFC < -0.5,]
+cat("There are", nrow(downregulated), "DEGs discovered")
+```
+
+## Plot
+
+```{r}
+library(ggplot2)
+
+# volcano plot
+limmaResult$dysregulated <- "not significant"
+limmaResult$dysregulated[limmaResult$logFC > 0.5 & limmaResult$adj.P.Val <0.05] <- 'upregulated'
+limmaResult$dysregulated[limmaResult$logFC < -0.5 & limmaResult$adj.P.Val <0.05] <- 'downregulated'
+
+ggplot(limmaResult, aes(x = logFC, y= -log10(P.Value), col = dysregulated)) + 
+  geom_point() +
+  scale_color_manual(values = c('purple', 'snow3', 'salmon3')) +
+  ggtitle("Dysregulated genes in diabetes vs control (GSE20966)")
+
+
+```
